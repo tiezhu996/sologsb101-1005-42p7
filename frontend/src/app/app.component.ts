@@ -85,7 +85,7 @@ interface NavItem {
           <div>桥梁 {{ bridgeStats().total }} 座 · 墩台 {{ bridgeStats().piers }} 个</div>
           <div>支座 {{ bearingStats().total }} 个（较重 {{ bearingStats().moderate }} · 严重 {{ bearingStats().severe }}）</div>
           <div>累计顶升 {{ stepStats().cumulativeMm }} mm · 测点 {{ stepStats().readingCount }} 条</div>
-          <div>验收 {{ acceptanceStats().total }} 条（不合格 {{ acceptanceStats().fail }}）</div>
+          <div>验收 {{ acceptanceStats().total }} 条（不合格 {{ acceptanceStats().fail }} · 调级失效 {{ acceptanceStats().stale }}）</div>
         </div>
       </mat-sidenav>
 
@@ -203,7 +203,7 @@ export class AppComponent implements OnInit {
     },
   });
   readonly acceptanceStats = toSignal(this.store.select(selectAcceptanceStats), {
-    initialValue: { total: 0, pass: 0, fail: 0, byStage: [] },
+    initialValue: { total: 0, pass: 0, fail: 0, stale: 0, byStage: [] },
   });
 
   /** 错误提示（写入失败等） */

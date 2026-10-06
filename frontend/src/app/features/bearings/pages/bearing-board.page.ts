@@ -13,6 +13,7 @@ import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { Inject } from '@angular/core';
 import {
   BEARING_TYPES,
@@ -41,7 +42,7 @@ import { StatBadgeComponent } from '../../../shared/components/common/stat-badge
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
 import { GradeTagComponent } from '../../../shared/components/common/grade-tag.component';
-import type { BearingRow, BridgeRow, PierRow } from '../../../core/utils/db';
+import type { AcceptanceRow, BearingRow, BridgeRow, PierRow } from '../../../core/utils/db';
 
 /** 支座表单对话框数据 */
 export interface BearingDialogData {
@@ -158,6 +159,7 @@ export class BearingDialogComponent {
     MatCheckboxModule,
     MatDialogModule,
     MatSnackBarModule,
+    MatTooltipModule,
     StatBadgeComponent,
     EmptyPanelComponent,
     FilterBarComponent,
@@ -286,6 +288,7 @@ export class BearingDialogComponent {
                 <th>病害等级</th>
                 <th>病害描述</th>
                 <th>更换建议</th>
+                <th>验收状态</th>
                 <th style="width: 210px">操作</th>
               </tr>
             </thead>
@@ -305,6 +308,21 @@ export class BearingDialogComponent {
                   <td><app-grade-tag [grade]="bearing.diseaseGrade" /></td>
                   <td class="gb-hint">{{ bearing.diseaseNote || '—' }}</td>
                   <td class="gb-hint">{{ needReplacement(bearing.diseaseGrade) ? '需更换' : '跟踪观测' }}</td>
+                  <td class="gb-hint">
+                    @if (bearing.hasStaleAcceptance) {
+                      <span class="stale-warn" [matTooltip]="'等级变更于 ' + (bearing.gradeChangedAt ?? '') + '，此前签署的验收已失效，须按四步顺序复验重签'">
+                        <mat-icon>history_toggle_off</mat-icon>
+                        验收已失效，待复验
+                      </span>
+                    } @else if (bearing.accepted) {
+                      <span class="accepted-text">
+                        <mat-icon>verified</mat-icon>
+                        四步验收合格（{{ bearing.acceptanceStages }}/4）
+                      </span>
+                    } @else {
+                      <span>有效验收 {{ bearing.acceptanceStages }}/4</span>
+                    }
+                  </td>
                   <td>
                     <div class="gb-row-actions">
                       <button mat-button (click)="openDialog(bearing)">
@@ -338,9 +356,40 @@ export class BearingDialogComponent {
             </mat-chip>
           }
         </div>
+        <div class="gb-hint reaccept-hint" style="margin-top: 8px">
+          调级复验口径：支座病害等级一经调整，该支座此前签署的分步验收立即失效（记录保留并标记「已失效」可查），
+          须在「分步验收与归档」页按「顶升到位 → 支座就位 → 落梁 → 竣工」四步顺序重签，全部有效合格后桥梁才能归档；
+          等级未变、或调级时尚未签署过验收的支座不受影响。
+        </div>
       </div>
     </mat-card>
   `,
+  styles: [
+    `
+      .stale-warn {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        color: #b71c1c;
+        font-weight: 600;
+      }
+      .stale-warn mat-icon,
+      .accepted-text mat-icon {
+        width: 16px;
+        height: 16px;
+        font-size: 16px;
+      }
+      .accepted-text {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        color: #1b5e20;
+      }
+      .reaccept-hint {
+        color: #b71c1c;
+      }
+    `,
+  ],
 })
 export class BearingBoardPage {
   private readonly store = inject(Store);
@@ -364,9 +413,12 @@ export class BearingBoardPage {
   readonly bearings: Signal<BearingRow[]> = toSignal(this.store.select((state) => state.bearing.bearings), {
     initialValue: [] as BearingRow[],
   });
+  private readonly acceptances = toSignal(this.store.select((state) => state.acceptance.acceptances), {
+    initialValue: [] as AcceptanceRow[],
+  });
 
   readonly bearingViews: Signal<BearingView[]> = computed(() =>
-    buildBearingViews(this.bearings(), this.piers(), this.bridges()),
+    buildBearingViews(this.bearings(), this.piers(), this.bridges(), this.acceptances()),
   );
   readonly stats = toSignal(this.store.select(selectBearingStats), {
     initialValue: { total: 0, intact: 0, slight: 0, moderate: 0, severe: 0, pending: 0 },
@@ -476,23 +528,47 @@ export class BearingBoardPage {
   bulkSetGrade(): void {
     const ids = this.selected();
     if (ids.length === 0) return;
+    const changed = ids.filter((id) => {
+      const bearing = this.bearings().find((item) => item.id === id);
+      return bearing && bearing.diseaseGrade !== this.bulkGrade();
+    });
     this.store.dispatch(bearingActions.bulkSetGrade({ ids, grade: this.bulkGrade() }));
-    this.notify(`已把 ${ids.length} 个支座等级设为${DISEASE_GRADE_LABEL[this.bulkGrade()]}`);
+    if (changed.length > 0) {
+      this.notify(
+        `已把 ${changed.length} 个支座等级设为${DISEASE_GRADE_LABEL[this.bulkGrade()]}；这些支座的既有验收已失效，须按四步顺序复验重签`,
+      );
+    } else {
+      this.notify('所选支座等级未发生变化，既有验收不受影响');
+    }
     this.selected.set([]);
   }
 
   bulkEscalate(): void {
     const ids = this.selected();
     if (ids.length === 0) return;
+    const changed = ids.filter((id) => {
+      const bearing = this.bearings().find((item) => item.id === id);
+      return bearing && escalateGrade(bearing.diseaseGrade) !== bearing.diseaseGrade;
+    });
     this.store.dispatch(bearingActions.bulkEscalate({ ids }));
-    this.notify(`已升级 ${ids.length} 个支座的病害等级`);
+    this.notify(
+      changed.length > 0
+        ? `已升级 ${changed.length} 个支座的病害等级；既有验收已失效，须按四步顺序复验重签`
+        : '所选支座均已为严重级，等级未变化，既有验收不受影响',
+    );
     this.selected.set([]);
   }
 
   escalateOne(bearing: BearingView): void {
     const next = escalateGrade(bearing.diseaseGrade);
+    if (next === bearing.diseaseGrade) {
+      this.notify(`${bearing.serial} 号支座已是严重级，等级未变化`);
+      return;
+    }
     this.store.dispatch(bearingActions.setGrade({ id: bearing.id, grade: next }));
-    this.notify(`${bearing.serial} 号支座等级已升级为${DISEASE_GRADE_LABEL[next]}`);
+    this.notify(
+      `${bearing.serial} 号支座等级已升级为${DISEASE_GRADE_LABEL[next]}；既有验收已失效，须按四步顺序复验重签`,
+    );
   }
 
   openDialog(bearing: BearingView | null): void {
@@ -527,8 +603,13 @@ export class BearingBoardPage {
       .subscribe((result: BearingDraft | null) => {
         if (!result) return;
         if (bearing) {
+          const gradeChanged = bearing.diseaseGrade !== result.diseaseGrade;
           this.store.dispatch(bearingActions.updateBearing({ id: bearing.id, draft: result }));
-          this.notify('支座信息已更新');
+          this.notify(
+            gradeChanged
+              ? '支座信息已更新；病害等级发生变化，既有验收已失效，须按四步顺序复验重签'
+              : '支座信息已更新',
+          );
         } else {
           this.store.dispatch(bearingActions.createBearing({ draft: result }));
           this.notify('支座已登记，可继续评级或编排顶升');

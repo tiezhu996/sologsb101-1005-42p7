@@ -18,7 +18,7 @@ import { ROW_REVISION, type Revisioned } from '../types/persistence';
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -99,6 +99,29 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.limitMm !== 'number' && typeof row.limit === 'number') row.limitMm = row.limit;
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
+      });
+
+    // v3：支座新增 gradeChangedAt（最近一次病害等级变更时间）。
+    //     历史数据一律补 null —— 未登记过等级变更，既有验收持续有效；
+    //     此后任何调级都会落时间戳，早于该时间的验收按失效处理并须复验重签。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+        piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+        bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+        steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+        readings: 'id, stepId, pointCode, recordedAt, [stepId+pointCode]',
+        acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('bearings')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.gradeChangedAt !== 'string') row.gradeChangedAt = null;
+            row.revision = ROW_REVISION;
+          });
       });
   }
 }
@@ -271,6 +294,8 @@ async function seedDatabase(): Promise<void> {
           spec: bearingSpec.spec,
           diseaseGrade: bearingSpec.grade,
           diseaseNote: bearingSpec.note,
+          // 播种数据视为登记后未调级，预置验收全部持续有效
+          gradeChangedAt: null,
           createdAt: stamp,
           revision: ROW_REVISION,
         });
