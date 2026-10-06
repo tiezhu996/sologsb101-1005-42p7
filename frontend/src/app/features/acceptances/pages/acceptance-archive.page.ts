@@ -20,7 +20,10 @@ import {
   ACCEPTANCE_STAGE_LABEL,
   archiveHint,
   archiveSummary,
-  stageOrder,
+  canSignInOrder,
+  effectiveStageConclusions,
+  missingPriorStages,
+  needsReinspection,
   stageOrderHint,
   type AcceptanceConclusion,
   type AcceptanceStage,
@@ -122,7 +125,7 @@ import type {
         title="合格 / 不合格"
         [value]="stats().pass + ' / ' + stats().fail"
         color="#2e7d32"
-        hint="不合格记录需整改后重新签署"
+        [hint]="'另有 ' + stats().invalid + ' 条调级前签署的失效记录需复验；不合格记录需整改后重签'"
       />
       <app-stat-badge
         title="支座验收完成率"
@@ -255,6 +258,9 @@ import type {
                   <td><app-grade-tag [grade]="row.diseaseGrade" /></td>
                   <td>
                     <div class="gb-tags">
+                      @if (reinspectionOf(row.id) && !fullyAccepted(row.id)) {
+                        <mat-chip class="stage-reinspect" [matTooltip]="summaryOf(row.id)">待复验</mat-chip>
+                      }
                       @for (stage of stages; track stage) {
                         <mat-chip [class]="chipClass(row.id, stage)">
                           {{ stageLabel[stage] }}{{ passed(row.id, stage) ? ' ✓' : '' }}
@@ -296,6 +302,7 @@ import type {
                 <th>桥梁 / 墩台</th>
                 <th>支座</th>
                 <th>结论</th>
+                <th>状态</th>
                 <th>验收人</th>
                 <th>验收时间</th>
                 <th style="width: 210px">操作</th>
@@ -303,13 +310,20 @@ import type {
             </thead>
             <tbody>
               @for (record of filtered(); track record.id) {
-                <tr>
+                <tr [class.is-stale]="!record.current">
                   <td>{{ stageLabel[record.stage] }}</td>
                   <td>{{ record.bridgeName }} · {{ record.pierCode }}</td>
                   <td>{{ record.bearingSerial }} · {{ record.bearingSpec }}</td>
                   <td><app-grade-tag [conclusion]="record.conclusion" /></td>
+                  <td>
+                    @if (record.current) {
+                      <span class="validity-valid">有效</span>
+                    } @else {
+                      <span class="validity-stale" [matTooltip]="record.invalidReason">失效（调级前签署）</span>
+                    }
+                  </td>
                   <td>{{ record.acceptor }}</td>
-                  <td>{{ record.acceptedAt }}</td>
+                  <td class="gb-mono">{{ record.acceptedAt }}</td>
                   <td>
                     <div class="gb-row-actions">
                       <button mat-button (click)="toggleConclusion(record)">
@@ -403,6 +417,31 @@ import type {
         background: #eceff1 !important;
         color: #546e7a !important;
       }
+      mat-chip.stage-reinspect {
+        background: #fff4e5 !important;
+        color: #e65100 !important;
+        font-weight: 600;
+      }
+      .validity-valid {
+        color: #1b5e20;
+        font-weight: 600;
+      }
+      .validity-stale {
+        color: #b71c1c;
+        font-weight: 600;
+        cursor: help;
+      }
+      tr.is-stale {
+        opacity: 0.72;
+      }
+      tr.is-stale td {
+        text-decoration: line-through;
+        text-decoration-color: rgba(183, 28, 28, 0.45);
+      }
+      tr.is-stale .validity-stale,
+      tr.is-stale .gb-row-actions {
+        text-decoration: none;
+      }
     `,
   ],
 })
@@ -441,7 +480,7 @@ export class AcceptanceArchivePage {
   private readonly counts = toSignal(this.idb.countAll$(), { initialValue: {} as Record<string, number> });
 
   readonly stats = toSignal(this.store.select(selectAcceptanceStats), {
-    initialValue: { total: 0, pass: 0, fail: 0, byStage: [] },
+    initialValue: { total: 0, pass: 0, fail: 0, invalid: 0, byStage: [] },
   });
   readonly lastArchiveSummary = toSignal(this.store.select(selectLastArchiveSummary), { initialValue: '' });
   readonly stepStats = toSignal(this.store.select(selectStepStats), {
@@ -540,22 +579,38 @@ export class AcceptanceArchivePage {
     });
   }
 
-  /** 某支座在指定分步是否已通过 */
+  /** 某支座在指定分步的最新有效结论是否合格 */
   passed(bearingId: string, stage: AcceptanceStage): boolean {
-    return this.acceptances().some(
-      (item) => item.bearingId === bearingId && item.stage === stage && item.conclusion === 'pass',
-    );
+    return this.conclusionsOf(bearingId).get(stage) === 'pass';
   }
 
   failed(bearingId: string, stage: AcceptanceStage): boolean {
-    return this.acceptances().some(
-      (item) => item.bearingId === bearingId && item.stage === stage && item.conclusion === 'fail',
-    );
+    return this.conclusionsOf(bearingId).get(stage) === 'fail';
+  }
+
+  /** 该支座的验收记录（含已失效） */
+  acceptancesOf(bearingId: string): AcceptanceRow[] {
+    return this.acceptances().filter((item) => item.bearingId === bearingId);
+  }
+
+  /** 该支座最近一次等级变更时间 */
+  gradeChangedAtOf(bearingId: string): string | undefined {
+    return this.bearings().find((item) => item.id === bearingId)?.gradeChangedAt;
+  }
+
+  /** 该支座各分步的最新有效结论（只看晚于最近一次调级的签署） */
+  conclusionsOf(bearingId: string): Map<AcceptanceStage, AcceptanceConclusion> {
+    return effectiveStageConclusions(this.acceptancesOf(bearingId), this.gradeChangedAtOf(bearingId));
+  }
+
+  /** 调级后是否需要复验 */
+  reinspectionOf(bearingId: string): boolean {
+    return needsReinspection(this.gradeChangedAtOf(bearingId), this.acceptancesOf(bearingId));
   }
 
   fullyAccepted(bearingId: string): boolean {
-    if (this.acceptances().some((item) => item.bearingId === bearingId && item.conclusion === 'fail')) return false;
-    return ACCEPTANCE_STAGES.every((stage) => this.passed(bearingId, stage));
+    const conclusions = this.conclusionsOf(bearingId);
+    return ACCEPTANCE_STAGES.every((stage) => conclusions.get(stage) === 'pass');
   }
 
   chipClass(bearingId: string, stage: AcceptanceStage): string {
@@ -564,10 +619,17 @@ export class AcceptanceArchivePage {
   }
 
   summaryOf(bearingId: string): string {
-    const passed = ACCEPTANCE_STAGES.filter((stage) => this.passed(bearingId, stage));
-    const failed = ACCEPTANCE_STAGES.filter((stage) => this.failed(bearingId, stage));
+    const gradeChangedAt = this.gradeChangedAtOf(bearingId);
+    if (this.reinspectionOf(bearingId) && !this.fullyAccepted(bearingId)) {
+      return `等级已于 ${gradeChangedAt} 变更，此前签署已失效，需按四步顺序复验`;
+    }
+    const conclusions = this.conclusionsOf(bearingId);
+    const passed = ACCEPTANCE_STAGES.filter((stage) => conclusions.get(stage) === 'pass');
+    const failed = ACCEPTANCE_STAGES.filter((stage) => conclusions.get(stage) === 'fail');
     if (failed.length > 0) return `不合格分步：${failed.map((stage) => ACCEPTANCE_STAGE_LABEL[stage]).join('、')}`;
-    if (passed.length === ACCEPTANCE_STAGES.length) return '四步验收全部合格，可归档';
+    if (passed.length === ACCEPTANCE_STAGES.length) {
+      return gradeChangedAt ? '调级后已四步重新复验合格，可归档' : '四步验收全部合格，可归档';
+    }
     const missing = ACCEPTANCE_STAGES.filter((stage) => !passed.includes(stage));
     return `待签署：${missing.map((stage) => ACCEPTANCE_STAGE_LABEL[stage]).join('、')}`;
   }
@@ -576,7 +638,39 @@ export class AcceptanceArchivePage {
     const passedStages = ACCEPTANCE_STAGES.filter((stage) =>
       this.selected().some((bearingId) => this.passed(bearingId, stage)),
     );
-    return stageOrderHint(this.batchStage(), passedStages);
+    const base = stageOrderHint(this.batchStage(), passedStages);
+    const reinspectionCount = this.selected().filter(
+      (bearingId) => this.reinspectionOf(bearingId) && !this.fullyAccepted(bearingId),
+    ).length;
+    if (reinspectionCount === 0) return base;
+    return `${base}；其中 ${reinspectionCount} 个支座调级后待复验，必须按「顶升到位 → 支座就位 → 落梁 → 竣工」顺序重签，跳步会被跳过`;
+  }
+
+  /** 当前批量签署中符合复验顺序要求的支座（效果端会再次复核，此处用于提前提示） */
+  eligibleSignTargets(): { ok: string[]; blocked: Array<{ id: string; missing: string[] }> } {
+    const ok: string[] = [];
+    const blocked: Array<{ id: string; missing: string[] }> = [];
+    for (const bearingId of this.selected()) {
+      const gradeChangedAt = this.gradeChangedAtOf(bearingId);
+      if (
+        this.batchConclusion() === 'pass' &&
+        needsReinspection(gradeChangedAt, this.acceptancesOf(bearingId)) &&
+        !canSignInOrder(this.batchStage(), this.acceptancesOf(bearingId), gradeChangedAt)
+      ) {
+        blocked.push({
+          id: bearingId,
+          missing: missingPriorStages(this.batchStage(), this.acceptancesOf(bearingId), gradeChangedAt),
+        });
+      } else {
+        ok.push(bearingId);
+      }
+    }
+    return { ok, blocked };
+  }
+
+  bearingLabel(bearingId: string): string {
+    const row = this.bearingRows().find((item) => item.id === bearingId);
+    return row ? `${row.bridgeName} ${row.pierCode}-${row.serial}` : bearingId;
   }
 
   archiveHintText(): string {
@@ -601,6 +695,15 @@ export class AcceptanceArchivePage {
   }
 
   signOne(bearingId: string, stage: AcceptanceStage): void {
+    const gradeChangedAt = this.gradeChangedAtOf(bearingId);
+    if (
+      needsReinspection(gradeChangedAt, this.acceptancesOf(bearingId)) &&
+      !canSignInOrder(stage, this.acceptancesOf(bearingId), gradeChangedAt)
+    ) {
+      const missing = missingPriorStages(stage, this.acceptancesOf(bearingId), gradeChangedAt);
+      this.notify(`调级后需按四步顺序复验，请先重签：${missing.join('、')}`);
+      return;
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
         bearingIds: [bearingId],
@@ -618,9 +721,17 @@ export class AcceptanceArchivePage {
   bulkSign(): void {
     const ids = this.selected();
     if (ids.length === 0) return;
+    const { ok, blocked } = this.eligibleSignTargets();
+    if (ok.length === 0) {
+      const detail = blocked
+        .map((item) => `${this.bearingLabel(item.id)}（缺${item.missing.join('、')}）`)
+        .join('；');
+      this.notify(`调级后须按四步顺序复验，本次所选支座均不能跳步签署：${detail}`);
+      return;
+    }
     this.store.dispatch(
       acceptanceActions.bulkSign({
-        bearingIds: ids,
+        bearingIds: ok,
         draft: {
           stage: this.batchStage(),
           conclusion: this.batchConclusion(),
@@ -629,11 +740,19 @@ export class AcceptanceArchivePage {
         },
       }),
     );
-    this.notify(
-      `已为 ${ids.length} 个支座签署「${ACCEPTANCE_STAGE_LABEL[this.batchStage()]}」结论：${
-        ACCEPTANCE_CONCLUSION_LABEL[this.batchConclusion()]
-      }`,
-    );
+    if (blocked.length > 0) {
+      this.notify(
+        `已为 ${ok.length} 个支座签署，${blocked.length} 个调级待复验支座因跳步被跳过：${blocked
+          .map((item) => this.bearingLabel(item.id))
+          .join('、')}`,
+      );
+    } else {
+      this.notify(
+        `已为 ${ok.length} 个支座签署「${ACCEPTANCE_STAGE_LABEL[this.batchStage()]}」结论：${
+          ACCEPTANCE_CONCLUSION_LABEL[this.batchConclusion()]
+        }`,
+      );
+    }
   }
 
   toggleConclusion(record: AcceptanceView): void {
@@ -717,7 +836,7 @@ export class AcceptanceArchivePage {
   }
 
   exportCsv(): void {
-    const header = ['分步', '桥梁', '墩台', '支座', '规格', '结论', '验收人', '验收时间'];
+    const header = ['分步', '桥梁', '墩台', '支座', '规格', '结论', '状态', '验收人', '验收时间'];
     const body = this.filtered().map((record) => [
       ACCEPTANCE_STAGE_LABEL[record.stage],
       record.bridgeName,
@@ -725,11 +844,12 @@ export class AcceptanceArchivePage {
       record.bearingSerial,
       record.bearingSpec,
       ACCEPTANCE_CONCLUSION_LABEL[record.conclusion],
+      record.current ? '有效' : '失效（调级前签署）',
       record.acceptor,
       record.acceptedAt,
     ]);
     downloadCsv(`gbbridgebear-acceptance-${new Date().toISOString().slice(0, 10)}.csv`, [header, ...body]);
-    this.notify('验收清单已导出 CSV');
+    this.notify('验收清单已导出 CSV（含失效记录标记）');
   }
 
   go(path: string): void {

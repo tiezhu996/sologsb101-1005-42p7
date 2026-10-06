@@ -35,6 +35,12 @@ import {
 } from '../utils/db';
 import type { AcceptanceRow } from '../utils/db';
 import { escalateGrade } from '../types/bearing';
+import {
+  canSignInOrder,
+  missingPriorStages,
+  needsReinspection,
+} from '../types/acceptance';
+import { nowDateTime } from '../utils/export';
 import { resequenceSteps } from '../types/step';
 import { checkBridgeArchived } from './archive.helper';
 
@@ -161,7 +167,7 @@ export class AppEffects {
     { dispatch: true },
   );
 
-  /** 桥梁：归档 / 撤销归档 */
+  /** 桥梁：归档 / 撤销归档（归档前服务端复核四步有效验收） */
   readonly archiveBridge$ = createEffect(
     () =>
       this.actions$.pipe(
@@ -169,6 +175,12 @@ export class AppEffects {
         switchMap(({ id, archived }) =>
           from(
             (async () => {
+              if (archived) {
+                const check = await checkBridgeArchived();
+                if (!check.archivableBridgeIds.includes(id)) {
+                  throw new Error('存在支座调级后未按四步顺序复验合格，不能归档');
+                }
+              }
               const existing = (await listBridges()).find((item) => item.id === id);
               if (!existing) return;
               await putBridge({ ...existing, archived });
@@ -317,6 +329,9 @@ export class AppEffects {
             (async () => {
               const existing = (await listBearings()).find((item) => item.id === id);
               if (!existing) return;
+              // 等级确实改动时记录变更时刻：早于该时刻的验收签署随即失效，需复验
+              const gradeChangedAt =
+                draft.diseaseGrade !== existing.diseaseGrade ? nowDateTime() : existing.gradeChangedAt;
               await putBearing({
                 ...existing,
                 pierId: draft.pierId,
@@ -325,6 +340,7 @@ export class AppEffects {
                 spec: draft.spec.trim(),
                 diseaseGrade: draft.diseaseGrade,
                 diseaseNote: draft.diseaseNote.trim(),
+                gradeChangedAt,
               });
               this.idb.emitChange();
             })(),
@@ -373,7 +389,10 @@ export class AppEffects {
             (async () => {
               const existing = (await listBearings()).find((item) => item.id === id);
               if (!existing) return;
-              await putBearing({ ...existing, diseaseGrade: grade });
+              const next: typeof existing = { ...existing, diseaseGrade: grade };
+              // 等级一改，此前签的验收就失效；等级没变则不动时间戳，旧验收继续有效
+              if (grade !== existing.diseaseGrade) next.gradeChangedAt = nowDateTime();
+              await putBearing(next);
               this.idb.emitChange();
             })(),
           ).pipe(
@@ -399,7 +418,13 @@ export class AppEffects {
             (async () => {
               const rows = (await listBearings()).filter((item) => ids.includes(item.id));
               if (rows.length === 0) return;
-              await putBearings(rows.map((item) => ({ ...item, diseaseGrade: grade })));
+              // 仅对等级确实变化的支座盖变更时间戳；等级没变的支座不受影响
+              const changedAt = nowDateTime();
+              await putBearings(
+                rows.map((item) =>
+                  item.diseaseGrade === grade ? item : { ...item, diseaseGrade: grade, gradeChangedAt: changedAt },
+                ),
+              );
               this.idb.emitChange();
             })(),
           ).pipe(
@@ -425,8 +450,15 @@ export class AppEffects {
             (async () => {
               const rows = (await listBearings()).filter((item) => ids.includes(item.id));
               if (rows.length === 0) return;
+              // 已严重的支座升级后仍是严重：等级没变，不盖时间戳；其余按升级时刻使旧验收失效
+              const changedAt = nowDateTime();
               await putBearings(
-                rows.map((item) => ({ ...item, diseaseGrade: escalateGrade(item.diseaseGrade) })),
+                rows.map((item) => {
+                  const nextGrade = escalateGrade(item.diseaseGrade);
+                  return nextGrade === item.diseaseGrade
+                    ? item
+                    : { ...item, diseaseGrade: nextGrade, gradeChangedAt: changedAt };
+                }),
               );
               this.idb.emitChange();
             })(),
@@ -674,7 +706,11 @@ export class AppEffects {
     { dispatch: true },
   );
 
-  /** 验收：批量分步签署，并在全部合格时回传归档摘要 */
+  /**
+   * 验收：批量分步签署，并在全部合格时回传归档摘要。
+   * 调级后复验的支座必须按四步顺序重签：前序分步缺有效合格记录时跳过该支座；
+   * 等级没变或调级时没签过的支座不做顺序闸门。
+   */
   readonly bulkSign$ = createEffect(
     () =>
       this.actions$.pipe(
@@ -682,8 +718,28 @@ export class AppEffects {
         switchMap(({ bearingIds, draft }) =>
           from(
             (async () => {
-              if (bearingIds.length === 0) return '';
-              const rows: AcceptanceRow[] = bearingIds.map((bearingId) => ({
+              if (bearingIds.length === 0) return { skipped: 0, detail: '', summary: '' };
+              const [allBearings, allAcceptances] = await Promise.all([listBearings(), listAcceptances()]);
+              const gradeAtOf = new Map(allBearings.map((item) => [item.id, item.gradeChangedAt]));
+              const skipped: Array<{ serial: string; missing: string[] }> = [];
+              const signableIds = bearingIds.filter((bearingId) => {
+                const gradeChangedAt = gradeAtOf.get(bearingId);
+                // 顺序闸门只对「调过级且调级前签过验收」的支座生效
+                if (draft.conclusion !== 'pass' || !needsReinspection(gradeChangedAt, allAcceptances)) return true;
+                if (canSignInOrder(draft.stage, allAcceptances, gradeChangedAt)) return true;
+                const bearing = allBearings.find((item) => item.id === bearingId);
+                skipped.push({
+                  serial: bearing?.serial ?? bearingId,
+                  missing: missingPriorStages(draft.stage, allAcceptances, gradeChangedAt),
+                });
+                return false;
+              });
+
+              if (signableIds.length === 0) {
+                return { skipped: skipped.length, detail: skipped.map((item) => item.serial).join('、'), summary: '' };
+              }
+
+              const rows: AcceptanceRow[] = signableIds.map((bearingId) => ({
                 id: newId('acc'),
                 bearingId,
                 stage: draft.stage,
@@ -695,14 +751,29 @@ export class AppEffects {
               await Promise.all(rows.map((row) => putAcceptance(row)));
               const check = await checkBridgeArchived();
               this.idb.emitChange();
-              return check.summaries.join('；');
+              return {
+                skipped: skipped.length,
+                detail: skipped
+                  .map((item) => `${item.serial}（缺${item.missing.join('、')}）`)
+                  .join('；'),
+                summary: check.summaries.join('；'),
+              };
             })(),
           ).pipe(
-            map((summary) =>
-              summary
-                ? acceptanceActions.archiveResult({ summary: `已满足归档条件：${summary}` })
-                : acceptanceActions.archiveResult({ summary: '本批次签署完成，尚不满足竣工归档条件' }),
-            ),
+            map(({ skipped, detail, summary }) => {
+              const messages: string[] = [];
+              if (skipped > 0) {
+                messages.push(
+                  `${skipped} 个调级待复验支座未按「顶升到位 → 支座就位 → 落梁 → 竣工」顺序重签，已跳过：${detail}`,
+                );
+              }
+              if (summary) {
+                messages.push(`已满足归档条件：${summary}`);
+              } else if (skipped === 0) {
+                messages.push('本批次签署完成，尚不满足竣工归档条件');
+              }
+              return acceptanceActions.archiveResult({ summary: messages.join('；') });
+            }),
             catchError((error: unknown) =>
               from([
                 writeFailed({ message: error instanceof Error ? error.message : '批量签署失败' }),
@@ -722,6 +793,12 @@ export class AppEffects {
         switchMap(({ bridgeId, archived, summary }) =>
           from(
             (async () => {
+              if (archived) {
+                const check = await checkBridgeArchived();
+                if (!check.archivableBridgeIds.includes(bridgeId)) {
+                  throw new Error('存在支座调级后未按四步顺序复验合格，不能归档');
+                }
+              }
               const existing = (await listBridges()).find((item) => item.id === bridgeId);
               if (existing) {
                 await putBridge({ ...existing, archived });

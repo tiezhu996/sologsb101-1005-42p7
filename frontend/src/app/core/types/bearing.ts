@@ -37,6 +37,12 @@ export interface Bearing extends RowMeta {
   diseaseGrade: DiseaseGrade;
   /** 病害描述 */
   diseaseNote: string;
+  /**
+   * 最近一次病害等级变更时间（yyyy-MM-dd HH:mm）。
+   * 仅在等级确实被改动时写入；未调过级的旧数据为 undefined。
+   * 早于该时间的验收签署全部失效，需按四步顺序复验。
+   */
+  gradeChangedAt?: string;
 }
 
 /** 支座表单草稿 */
@@ -56,10 +62,14 @@ export interface BearingView extends Bearing {
   bridgeName: string;
   /** 是否需要更换 */
   needReplacement: boolean;
-  /** 该支座的验收进度（已通过阶段数 / 4） */
+  /** 该支座对当前等级仍有效的验收通过阶段数（0~4） */
   acceptanceStages: number;
-  /** 是否已全部验收合格 */
+  /** 对当前等级是否已四步全部验收合格 */
   accepted: boolean;
+  /** 调级后是否需要复验（调级前签过、调级后未按四步重签完） */
+  reinspection: boolean;
+  /** 因调级失效的验收记录条数 */
+  staleAcceptanceCount: number;
 }
 
 /** 等级权重：严重 > 较重 > 轻微 > 完好 */

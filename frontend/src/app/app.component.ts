@@ -203,7 +203,7 @@ export class AppComponent implements OnInit {
     },
   });
   readonly acceptanceStats = toSignal(this.store.select(selectAcceptanceStats), {
-    initialValue: { total: 0, pass: 0, fail: 0, byStage: [] },
+    initialValue: { total: 0, pass: 0, fail: 0, invalid: 0, byStage: [] },
   });
 
   /** 错误提示（写入失败等） */

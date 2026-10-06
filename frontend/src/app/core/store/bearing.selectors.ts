@@ -1,6 +1,12 @@
 import { createFeatureSelector, createSelector } from '@ngrx/store';
 import type { BearingState } from './bearing.reducer';
-import type { BearingRow, PierRow, BridgeRow } from '../utils/db';
+import type { AcceptanceRow, BearingRow, PierRow, BridgeRow } from '../utils/db';
+import {
+  ACCEPTANCE_STAGES,
+  effectiveStageConclusions,
+  isAcceptanceCurrent,
+  needsReinspection,
+} from '../types/acceptance';
 import {
   countByGrade,
   needReplacement,
@@ -13,23 +19,37 @@ export const selectBearingState = createFeatureSelector<BearingState>('bearing')
 export const selectBearings = createSelector(selectBearingState, (state) => state.bearings);
 export const selectGradeFilter = createSelector(selectBearingState, (state) => state.gradeFilter);
 
-/** 支座视图：带墩台与桥梁上下文 */
+/** 支座视图：带墩台、桥梁上下文与对当前等级的验收 / 复验派生状态 */
 export function buildBearingViews(
   bearings: BearingRow[],
   piers: PierRow[],
   bridges: BridgeRow[],
+  acceptances: AcceptanceRow[] = [],
 ): BearingView[] {
   return bearings.map((bearing) => {
     const pier = piers.find((item) => item.id === bearing.pierId);
     const bridge = pier ? bridges.find((item) => item.id === pier.bridgeId) : undefined;
+    const ownAcceptances = acceptances.filter((item) => item.bearingId === bearing.id);
+    const conclusions = effectiveStageConclusions(ownAcceptances, bearing.gradeChangedAt);
+    const passedStageCount = ACCEPTANCE_STAGES.filter(
+      (stage) => conclusions.get(stage) === 'pass',
+    ).length;
+    const staleCount = bearing.gradeChangedAt
+      ? ownAcceptances.filter((item) => !isAcceptanceCurrent(item, bearing.gradeChangedAt)).length
+      : 0;
     return {
       ...bearing,
       pierCode: pier?.code ?? '已删除墩台',
       bridgeId: bridge?.id ?? '',
       bridgeName: bridge?.name ?? '未归属桥梁',
       needReplacement: needReplacement(bearing.diseaseGrade),
-      acceptanceStages: 0,
-      accepted: false,
+      acceptanceStages: passedStageCount,
+      accepted: passedStageCount === ACCEPTANCE_STAGES.length,
+      // 调过级、调级前签过、且四步尚未全部重签合格 → 待复验
+      reinspection:
+        needsReinspection(bearing.gradeChangedAt, ownAcceptances) &&
+        passedStageCount < ACCEPTANCE_STAGES.length,
+      staleAcceptanceCount: staleCount,
     };
   });
 }

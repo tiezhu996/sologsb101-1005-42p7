@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 编排分级顶升步骤（目标顶升量、同步要求、限位值、负责人），支持上移 / 下移调序与**累计顶升量校验**
 - 按步骤批量录入多测点位移与应力，实时计算**同步偏差**（同批次极差）并按限位值给出告警
 - 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），全部支座合格后可执行竣工归档
+- **调级复验联动**：支座病害等级一旦变更（批量调级 / 升级 / 评级编辑），早于最近一次等级变更时间的验收签署立即失效，必须按四步顺序重新复验合格后才重新计入归档；失效记录保留并标记，仍可查询。等级未变或调级时未签过验收的支座不受影响
 - 查看 IndexedDB 结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -98,14 +99,15 @@ sologsb101-1005/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbbridgebear`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）。
+- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，登记 v1 → v2（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）与 v2 → v3（支座新增 `gradeChangedAt` 最近一次等级变更时间，索引不变；迁移不回填，缺省即视为从未调级，避免历史合格记录被误判失效）的 `upgrade` 迁移。
+- **调级复验判定**：验收是否有效只取决于「签署时间是否严格晚于该支座最近一次等级变更时间（`Bearing.gradeChangedAt`）」，而不是当前等级——因此严重改回轻微后，旧合格记录不会复活。归档判定（`core/store/archive.helper.ts`）与验收页四步进度只统计有效记录；调级后重签必须按「顶升到位 → 支座就位 → 落梁 → 竣工」顺序，跳步签署会在页面预检与 effect 写入两处被拦截；失效记录保留在 `acceptances` 表中，列表以「失效（调级前签署）」标记并可查询 / 导出。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
   | --- | --- | --- |
   | `bridges` | 桥梁 | id / name / bridgeType / builtYear / roadClass / archived |
   | `piers` | 墩台 | id / bridgeId / code / capElevation / [bridgeId+code] |
-  | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial] |
+  | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial]（另有 `gradeChangedAt` 最近调级时间，不建索引） |
   | `steps` | 顶升步骤 | id / bridgeId / seq / state / syncRequirement / [bridgeId+seq] |
   | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
   | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / [bearingId+stage] |

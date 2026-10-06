@@ -18,7 +18,7 @@ import { ROW_REVISION, type Revisioned } from '../types/persistence';
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -100,6 +100,19 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：支座新增 gradeChangedAt（最近一次等级变更时间），索引不变。
+    //     迁移刻意不回填：历史等级变更时间无据可查，缺省即视为「从未调级」，
+    //     旧验收继续有效，避免把历史合格记录误判为失效。
+    this.version(DB_SCHEMA_VERSION).stores({
+      bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+      piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+      bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+      steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+      readings: 'id, stepId, pointCode, recordedAt, [stepId+pointCode]',
+      acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+      settings: 'id',
+    });
   }
 }
 
@@ -135,7 +148,17 @@ interface SeedBridgeSpec {
     code: string;
     capElevation: number;
     type: Pier['type'];
-    bearings: Array<{ serial: string; type: Bearing['type']; spec: string; grade: DiseaseGrade; note: string }>;
+    bearings: Array<{
+      serial: string;
+      type: Bearing['type'];
+      spec: string;
+      grade: DiseaseGrade;
+      note: string;
+      /** 覆盖默认的初始验收通过阶段数（用于演示调级后复验场景） */
+      passedCount?: number;
+      /** 最近一次调级时间（设置后早于该时间的验收播种记录均失效） */
+      gradeChangedAt?: string;
+    }>;
   }>;
   steps: Array<{ targetLiftMm: number; sync: SyncRequirement; limitMm: number; leader: string; state: Step['state'] }>;
 }
@@ -154,7 +177,15 @@ const SEED_BRIDGES: SeedBridgeSpec[] = [
         type: 'abutment',
         bearings: [
           { serial: '1', type: 'plate', spec: 'GJZ 300×400', grade: 'moderate', note: '支座剪切变形 8mm，垫石局部破损' },
-          { serial: '2', type: 'plate', spec: 'GJZ 300×400', grade: 'slight', note: '表面轻微老化开裂' },
+          {
+            serial: '2',
+            type: 'plate',
+            spec: 'GJZ 300×400',
+            grade: 'slight',
+            note: '复查降级为轻微，但调级前已按旧等级签完四步合格，需复验',
+            passedCount: 4,
+            gradeChangedAt: dateTimeText(0, 14, 0),
+          },
         ],
       },
       {
@@ -271,13 +302,22 @@ async function seedDatabase(): Promise<void> {
           spec: bearingSpec.spec,
           diseaseGrade: bearingSpec.grade,
           diseaseNote: bearingSpec.note,
+          // 调级时间仅在演示复验场景下写入；缺省表示从未调过级
+          gradeChangedAt: bearingSpec.gradeChangedAt,
           createdAt: stamp,
           revision: ROW_REVISION,
         });
 
-        // 验收：完好 / 轻微支座完成前两步，其余按序推进
+        // 验收：完好 / 轻微支座完成前两步，其余按序推进；passedCount 可覆盖用于演示调级复验
         const passedCount =
-          bearingSpec.grade === 'intact' ? 4 : bearingSpec.grade === 'slight' ? 2 : bearingSpec.grade === 'moderate' ? 1 : 0;
+          bearingSpec.passedCount ??
+          (bearingSpec.grade === 'intact'
+            ? 4
+            : bearingSpec.grade === 'slight'
+              ? 2
+              : bearingSpec.grade === 'moderate'
+                ? 1
+                : 0);
         const stageList: AcceptanceStage[] = ['lifted', 'bearingPlaced', 'beamLowered', 'completed'];
         for (let stageIndex = 0; stageIndex < passedCount; stageIndex += 1) {
           acceptances.push({
